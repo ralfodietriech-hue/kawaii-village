@@ -6,7 +6,7 @@
    - Chat + emotes are relayed too. Each player keeps their OWN save game; only presence is shared.
 
    Run:   npm install && npm start      (then open http://localhost:3000)
-   Env:   PORT (3000)  MAX_PLAYERS (8)  ALLOWED_ORIGIN ("*" by default)
+   Env:   PORT (3000)  MAX_PLAYERS (8)  ALLOWED_ORIGIN ("*" by default)  LB_FILE (leaderboard save file)
    ===================================================================== */
 const http = require('http');
 const fs = require('fs');
@@ -92,6 +92,41 @@ function enterRoom(socket, room, name, look, st) {
   return [...room.players.values()].filter(q => q.id !== socket.id).map(publicPlayer);
 }
 
+/* ---------- global leaderboard (kept in memory, saved to ./data/leaderboard.json) ---------- */
+const LB_FILE = process.env.LB_FILE || path.join(__dirname, 'data', 'leaderboard.json');
+const LB_MAX = { wealth: 1e9, level: 1e7, rats: 1e6, games: 1e7, fish: 1e6, thief: 1e6, badges: 1e3 };  // allowed categories + sanity caps
+const LB_KEEP = 500;                                    // entries kept per category
+let board = {};                                         // { cat: { uid: { n, sp, v, t } } }
+for (const c of Object.keys(LB_MAX)) board[c] = {};
+try {
+  const saved = JSON.parse(fs.readFileSync(LB_FILE, 'utf8'));
+  for (const c of Object.keys(LB_MAX)) if (saved[c] && typeof saved[c] === 'object') board[c] = saved[c];
+  console.log('🏆 Leaderboard loaded from ' + LB_FILE);
+} catch (e) { /* first run: nothing saved yet */ }
+let lbTimer = null;
+function lbSaveSoon() {
+  if (lbTimer) return;
+  lbTimer = setTimeout(() => {
+    lbTimer = null;
+    try {
+      fs.mkdirSync(path.dirname(LB_FILE), { recursive: true });
+      const tmp = LB_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(board));
+      fs.renameSync(tmp, LB_FILE);
+    } catch (e) { console.warn('Could not save leaderboard:', e.message); }
+  }, 3000);
+}
+const cleanName = s => String(s == null ? '' : s).replace(/[\u0000-\u001f<>&"']/g, '').trim().slice(0, 14) || 'Player';
+function lbTop(cat, n) {
+  return Object.entries(board[cat]).sort((a, b) => b[1].v - a[1].v || a[1].t - b[1].t).slice(0, n);
+}
+function lbPrune(cat) {
+  const all = Object.entries(board[cat]);
+  if (all.length <= LB_KEEP) return;
+  all.sort((a, b) => b[1].v - a[1].v);
+  board[cat] = Object.fromEntries(all.slice(0, LB_KEEP));
+}
+
 /* ---------- socket events ---------- */
 io.on('connection', socket => {
   socket.data = { room: null, stateAt: 0, joinTries: [] };
@@ -148,6 +183,46 @@ io.on('connection', socket => {
     const code = socket.data.room; if (!code) return;
     const e = msg && msg.e; if (!EMOTES.has(e)) return;
     socket.to(code).emit('emote', { id: socket.id, e });
+  });
+
+  /* ----- leaderboard (works without being in a room) ----- */
+  socket.on('lb:submit', (msg, ack) => {
+    const reply = r => { if (typeof ack === 'function') ack(r); };
+    const now = Date.now();
+    if (now - (socket.data.lbAt || 0) < 3000) return reply({ ok: false, error: 'Too fast, wait a few seconds.' });
+    socket.data.lbAt = now;
+    if (!msg || typeof msg !== 'object' || !/^[a-f0-9]{16}$/.test(msg.uid || '') || !msg.vals || typeof msg.vals !== 'object') return reply({ ok: false, error: 'Bad request.' });
+    const sp = /^[a-z]{2,12}$/.test(msg.sp || '') ? msg.sp : 'cat';
+    const name = cleanName(msg.name);
+    for (const cat of Object.keys(LB_MAX)) {
+      const v = Math.floor(+msg.vals[cat]);
+      if (!Number.isFinite(v) || v < 0 || v > LB_MAX[cat]) continue;
+      if (v === 0) { delete board[cat][msg.uid]; continue; }          // no empty rows
+      const old = board[cat][msg.uid];
+      board[cat][msg.uid] = { n: name, sp, v, t: old ? old.t : now };
+      lbPrune(cat);
+    }
+    lbSaveSoon();
+    reply({ ok: true });
+  });
+
+  socket.on('lb:get', (msg, ack) => {
+    if (typeof ack !== 'function') return;
+    const uid = msg && /^[a-f0-9]{16}$/.test(msg.uid || '') ? msg.uid : '';
+    const boards = {}, me = {};
+    for (const cat of Object.keys(LB_MAX)) {
+      const all = lbTop(cat, LB_KEEP);
+      boards[cat] = all.slice(0, 20).map(([u, e]) => ({ n: e.n, sp: e.sp, v: e.v, me: u === uid ? 1 : 0 }));
+      const i = all.findIndex(([u]) => u === uid);
+      if (i >= 0) me[cat] = { rank: i + 1, total: all.length, v: all[i][1].v };
+    }
+    ack({ ok: true, boards, me });
+  });
+
+  socket.on('lb:forget', (msg, ack) => {
+    const uid = msg && /^[a-f0-9]{16}$/.test(msg.uid || '') ? msg.uid : '';
+    if (uid) { for (const cat of Object.keys(LB_MAX)) delete board[cat][uid]; lbSaveSoon(); }
+    if (typeof ack === 'function') ack({ ok: true });
   });
 
   socket.on('disconnect', () => leaveRoom(socket));
