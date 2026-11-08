@@ -1,0 +1,9 @@
+{
+  "name": "kawaii-village-multiplayer",
+  "version": "1.0.0",
+  "description": "Room-code multiplayer server for Kawaii Village 3D (Node.js + Socket.io)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "socket.io": "^4.7.5" }
+}
